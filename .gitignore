@@ -1,0 +1,5 @@
+Dataset/
+checkpoints/
+zubairEnv/
+__pycache__/
+.ipynb_checkpoints/

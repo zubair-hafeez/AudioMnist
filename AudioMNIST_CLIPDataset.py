@@ -8,19 +8,6 @@ import json
 from glob import glob
 
 class AudioMNIST_CLIPDataset(Dataset):
-    """
-    AudioMNIST_CLIPDataset
-    ----------------------
-    Loads the AudioMNIST dataset from Dataset/Data/ and returns (datapoint, prompt) tuples
-    for CLIP-style training (audio ↔ text).
-
-    Example output:
-        (
-            torch.Tensor of shape [2, 128, 44],
-            "A 30-year-old male German speaker saying the digit 7."
-        )
-    """
-
     def __init__(
         self,
         root="./Dataset",
@@ -47,7 +34,6 @@ class AudioMNIST_CLIPDataset(Dataset):
         self.samples = self._build_samples()
 
     def _build_samples(self):
-        """Collect all wav files and attach a prompt using metadata."""
         samples = []
         speaker_dirs = sorted(os.listdir(self.root))
 
@@ -72,7 +58,6 @@ class AudioMNIST_CLIPDataset(Dataset):
         return samples
 
     def get_spectrogram(self, waveform):
-        """Compute normalized complex STFT spectrogram."""
         f, t, Zxx = scipy.signal.stft(
             waveform,
             self.target_sample_rate,
@@ -90,14 +75,12 @@ class AudioMNIST_CLIPDataset(Dataset):
         return Zxx_normalized
 
     def complex_to_2d(self, tensor):
-        """Split a complex tensor into two channels: real and imaginary."""
         new_tensor = np.zeros((2, tensor.shape[0]), dtype=np.float64)
         new_tensor[0] = np.real(tensor)
         new_tensor[1] = np.imag(tensor)
         return new_tensor
 
     def __getitem__(self, index):
-        """Return (audio_tensor, prompt) tuple with auto padding."""
         file_path, prompt = self.samples[index]
         waveform, _ = librosa.load(file_path, sr=self.target_sample_rate, duration=self.duration)
         if self.transform:
