@@ -1,120 +1,71 @@
 import torch
-import torch.nn.functional as F
-from torch.utils.data import DataLoader
-from tqdm import tqdm
-
-from AudioMNIST_CLIPDataset import AudioMNIST_CLIPDataset
+import os
 from clip_model import CLIP
+from AudioMNIST_CLIPDataset import AudioMNIST_CLIPDataset
 
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-CKPT_PATH = "checkpoints/clip_audio_epoch150.pth"
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+from tokenizers import Tokenizer
 
+bpe_tokenizer = Tokenizer.from_file("bpe_tokenizer.json")
 
-def tokenizer(text: str, max_len=32):
-    txt = chr(2) + text + chr(3)
+def tokenizer(text: str, max_seq_length: int = 32):
+    encoded = bpe_tokenizer.encode(text)
 
-    if len(txt) > max_len:
-        txt = txt[:max_len]
+    ids = encoded.ids[:max_seq_length]
 
-    txt = txt + "".join([chr(0) for _ in range(max_len - len(txt))])
+    while len(ids) < max_seq_length:
+        ids.append(0)  # pad with <pad> id (0)
 
-    tokens = torch.tensor(list(txt.encode("utf-8")), dtype=torch.long)
+    mask = [1 if x != 0 else 0 for x in ids]
 
-    mask_1d = torch.ones(len(tokens.nonzero()), dtype=torch.int32)
-    mask_1d = torch.cat(
-        (mask_1d,
-         torch.zeros(max_len - len(mask_1d), dtype=torch.int32))
-    )
-
-    return tokens, mask_1d
+    return torch.tensor(ids, dtype=torch.int32), torch.tensor(mask, dtype=torch.int32)
 
 
+dataset = AudioMNIST_CLIPDataset("./Dataset")
+all_audios = []
+all_prompts = []
 
-def load_model():
-    model = CLIP(
-        emb_dim=512,          
-        vit_width=256,
-        n_patches=44,
-        patch_dim=256,
-        vit_layers=6,
-        vit_heads=4,
-        vocab_size=256,
-        text_width=512,       
-        max_seq_length=32,
-        text_heads=8,         
-        text_layers=8         
-    )
+for i in range(len(dataset)):
+    a, p = dataset[i]
+    all_audios.append(a)
+    all_prompts.append(p)
 
-    state = torch.load(CKPT_PATH, map_location=DEVICE)
-    model.load_state_dict(state)
-    model.to(DEVICE)
-    model.eval()
-    return model
+all_audios = torch.stack(all_audios).to(device)
 
 
-def build_audio_index(model, dataset):
-    loader = DataLoader(dataset, batch_size=32, shuffle=False)
+B, C, F, T = all_audios.shape
+audio_patches = all_audios.permute(0, 3, 1, 2).reshape(B, T, 256)
 
-    all_embs = []
-    all_prompts = []
-    all_paths = []
+
+model = CLIP().to(device)
+model.load_state_dict(torch.load("checkpoints/clip_audio_epoch250.pth", map_location=device))
+model.eval()
+
+print("\nIndexing Audio...\n")
+with torch.no_grad():
+    audio_features = model.audio_encoder(audio_patches)
+    audio_features = audio_features / audio_features.norm(dim=-1, keepdim=True)
+
+while True:
+    text = input("Enter prompt (or quit): ")
+    if text.strip().lower() == "quit":
+        break
+
+    tok, mask1d = tokenizer(text, 32)
+    tok = tok.unsqueeze(0).to(device).long()
+    L = 32
+    mask = mask1d.unsqueeze(0).unsqueeze(1).repeat(1, L, 1).to(device)
 
     with torch.no_grad():
-        for batch_audio, batch_prompts in tqdm(loader, desc="Indexing Audio"):
-            B = batch_audio.shape[0]
+        tfeat = model.text_encoder(tok, mask)
+        tfeat = tfeat / tfeat.norm(dim=-1, keepdim=True)
+        sim = (audio_features @ tfeat.t()).squeeze()
 
-            patches = batch_audio.permute(0, 3, 1, 2).reshape(B, 44, 256).to(DEVICE)
+    topk = torch.topk(sim, 5)
+    print("\nTop 5 matches:")
+    for score, idx in zip(topk.values.cpu(), topk.indices.cpu()):
+        file_path, _ = dataset.samples[idx]
+        print(f"{score:.4f} | {file_path}")
+print()
 
-            emb = model.audio_encoder(patches)
-            emb = F.normalize(emb, dim=-1)
-
-            all_embs.append(emb.cpu())
-            all_prompts.extend(batch_prompts)
-
-            for _ in range(B):
-                all_paths.append(dataset.samples[len(all_paths)][0])
-
-    return torch.cat(all_embs, dim=0), all_prompts, all_paths
-
-
-def retrieve_audio(model, audio_embs, paths, prompts):
-    while True:
-        query = input("\nEnter prompt (or quit): ").strip()
-        if query.lower() == "quit":
-            break
-
-        tokens, m1 = tokenizer(query)
-        tokens = tokens.unsqueeze(0).to(DEVICE)
-        m1 = m1.to(DEVICE)
-
-        L = 32
-        mask = m1.unsqueeze(0).unsqueeze(1).repeat(1, L, 1)
-
-        with torch.no_grad():
-            txt_emb = model.text_encoder(tokens, mask=mask)
-            txt_emb = F.normalize(txt_emb, dim=-1)
-
-            sims = txt_emb @ audio_embs.T
-            sims = sims.squeeze(0)
-
-        vals, idx = torch.topk(sims, k=5)
-
-        print("\nTop 5 matches:")
-        for v, j in zip(vals, idx):
-            print(f"{v:.4f} | {paths[j]} | {prompts[j]}")
-
-
-
-def main():
-    dataset = AudioMNIST_CLIPDataset(root="./Dataset")
-    model = load_model()
-
-    audio_embs, prompts, paths = build_audio_index(model, dataset)
-    audio_embs = audio_embs.to(DEVICE)
-
-    retrieve_audio(model, audio_embs, paths, prompts)
-
-
-if __name__ == "__main__":
-    main()

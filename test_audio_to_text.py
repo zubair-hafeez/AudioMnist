@@ -1,150 +1,69 @@
 import torch
-import torch.nn.functional as F
-import numpy as np
-import librosa
-import scipy.signal
-from tqdm import tqdm
-
-from AudioMNIST_CLIPDataset import AudioMNIST_CLIPDataset
+import os
 from clip_model import CLIP
+from AudioMNIST_CLIPDataset import AudioMNIST_CLIPDataset
 
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-CKPT_PATH = "checkpoints/clip_audio_epoch150.pth"
-TARGET_SR = 12000
-NFFT = 512
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-
-def tokenizer(text: str, max_len=32):
-    txt = chr(2) + text + chr(3)
-
-    if len(txt) > max_len:
-        txt = txt[:max_len]
-
-    txt = txt + "".join([chr(0) for _ in range(max_len - len(txt))])
-
-    tokens = torch.tensor(list(txt.encode("utf-8")), dtype=torch.long)
-
-    mask_1d = torch.ones(len(tokens.nonzero()), dtype=torch.int32)
-    mask_1d = torch.cat(
-        (mask_1d,
-         torch.zeros(max_len - len(mask_1d), dtype=torch.int32))
-    )
-
-    return tokens, mask_1d
+def tokenizer(text, max_seq_length=32):
+    out = chr(2) + text + chr(3)
+    if len(out) > max_seq_length:
+        out = out[:max_seq_length]
+    out = out + "".join([chr(0) for _ in range(max_seq_length - len(out))])
+    out = torch.IntTensor(list(out.encode("utf-8")))
+    mask_1d = torch.ones(len(out.nonzero()), dtype=torch.int32)
+    mask_1d = torch.cat((mask_1d, torch.zeros(max_seq_length - len(mask_1d), dtype=torch.int32)))
+    return out, mask_1d
 
 
-def load_model():
-    model = CLIP(
-        emb_dim=512,
-        vit_width=256,
-        n_patches=44,
-        patch_dim=256,
-        vit_layers=6,
-        vit_heads=4,
-        vocab_size=256,
-        text_width=512,
-        max_seq_length=32,
-        text_heads=8,
-        text_layers=8
-    )
+dataset = AudioMNIST_CLIPDataset("./Dataset")
 
-    state = torch.load(CKPT_PATH, map_location=DEVICE)
-    model.load_state_dict(state)
-    model.to(DEVICE)
-    model.eval()
-    return model
+prompts = []
+for i in range(len(dataset)):
+    _, p = dataset[i]
+    prompts.append(p)
+
+tok_list = []
+mask_list = []
+for p in prompts:
+    tok, m = tokenizer(p, 32)
+    tok_list.append(tok)
+    mask_list.append(m)
+
+text_tokens = torch.stack(tok_list).long().to(device)
+mask_1d = torch.stack(mask_list).to(device)
+L = 32
+mask = mask_1d.unsqueeze(1).repeat(1, L, 1).to(device)
 
 
+model = CLIP().to(device)
+model.load_state_dict(torch.load("checkpoints/clip_audio_epoch250.pth", map_location=device))
+model.eval()
 
-def make_patches_from_wav(path):
-    waveform, _ = librosa.load(path, sr=TARGET_SR)
+with torch.no_grad():
+    text_features = model.text_encoder(text_tokens, mask)
+    text_features = text_features / text_features.norm(dim=-1, keepdim=True)
 
-    f, t, Z = scipy.signal.stft(
-        waveform,
-        TARGET_SR,
-        nperseg=NFFT//2,
-        noverlap=NFFT//4,
-        window="hann"
-    )
+while True:
+    idx_raw = input("\nEnter audio index (0–937) or quit: ")
+    if idx_raw.lower() == "quit":
+        break
 
-    Z = Z[0:128, :-1]
-    amp = np.abs(Z)
-    phase = np.angle(Z)
+    idx = int(idx_raw)
+    audio, _ = dataset[idx]
+    audio = audio.unsqueeze(0).to(device)
 
-    eps = 1e-10
-    norm = (amp - amp.min()) / (amp.max() - amp.min() + eps)
-    Zc = norm * np.exp(1j * phase)
-
-    real = np.real(Zc)
-    imag = np.imag(Zc)
-    spec = np.stack([real, imag], axis=0)
-
-    if spec.shape[-1] < 44:
-        spec = np.pad(spec, ((0,0),(0,0),(0,44 - spec.shape[-1])))
-    else:
-        spec = spec[:, :, :44]
-
-    patches = torch.tensor(spec, dtype=torch.float32)
-    patches = patches.permute(2, 0, 1).reshape(44, 256)
-
-    return patches.unsqueeze(0)  # shape (1, 44, 256)
-
-
-def build_text_index(model, dataset):
-    text_embs = []
-    prompts = []
+    B, C, F, T = audio.shape
+    audio_patches = audio.permute(0, 3, 1, 2).reshape(1, T, 256)
 
     with torch.no_grad():
-        for _, prompt in tqdm(dataset, desc="Indexing Text"):
-            tok, m1 = tokenizer(prompt)
-            tok = tok.unsqueeze(0).to(DEVICE)
-            m1 = m1.to(DEVICE)
+        afeat = model.audio_encoder(audio_patches)
+        afeat = afeat / afeat.norm(dim=-1, keepdim=True)
+        sim = (afeat @ text_features.t()).squeeze()
 
-            L = 32
-            mask = m1.unsqueeze(0).unsqueeze(1).repeat(1, L, 1)
+    topk = torch.topk(sim, 5)
 
-            emb = model.text_encoder(tok, mask)
-            emb = F.normalize(emb, dim=-1)
-
-            text_embs.append(emb.cpu())
-            prompts.append(prompt)
-
-    return torch.cat(text_embs, dim=0), prompts
-
-
-
-def retrieve_text(model, text_embs, prompts):
-    while True:
-        path = input("\nEnter .wav file path (or quit): ")
-        if path.lower() == "quit":
-            break
-
-        patches = make_patches_from_wav(path).to(DEVICE)
-
-        with torch.no_grad():
-            audio_emb = model.audio_encoder(patches)
-            audio_emb = F.normalize(audio_emb, dim=-1)
-
-            sims = audio_emb @ text_embs.T
-            sims = sims.squeeze(0)
-
-        vals, idx = torch.topk(sims, k=5)
-
-        print("\nTop 5 matching prompts:")
-        for v, j in zip(vals, idx):
-            print(f"{v:.4f} | {prompts[j]}")
-
-
-
-def main():
-    dataset = AudioMNIST_CLIPDataset(root="./Dataset")
-    model = load_model()
-
-    text_embs, prompts = build_text_index(model, dataset)
-    text_embs = text_embs.to(DEVICE)
-
-    retrieve_text(model, text_embs, prompts)
-
-
-if __name__ == "__main__":
-    main()
+    print("\nTop 5 text matches:")
+    for score, i in zip(topk.values.cpu(), topk.indices.cpu()):
+        print(f"{score:.4f} | {prompts[i]}")
+    print()
